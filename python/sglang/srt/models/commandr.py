@@ -36,24 +36,32 @@
 
 # This file is based on the LLama model definition file in transformers
 """PyTorch Cohere model."""
+from transformers import Cohere2ForCausalLM, CohereForCausalLM # TODO remove later, here for reference
 
 from typing import Iterable, Optional, Tuple
 
 import torch
-import torch.utils.checkpoint
+import torch.utils.checkpoint # probably can remove
 from torch import nn
-from torch.nn.parameter import Parameter
-from transformers import PretrainedConfig
+from torch.nn.parameter import Parameter # tags a Tensor as a parameter, allows model to load in a weight/parameter
+from transformers import PretrainedConfig # contains all the hyperparameters of the model
 
 from sglang.srt.distributed import (
-    get_tensor_model_parallel_rank,
-    get_tensor_model_parallel_world_size,
+    get_tensor_model_parallel_rank, # GPU 0 returns 0, GPU 1 return 1 ...
+    get_tensor_model_parallel_world_size, # How many GPUs running in parallel --tp 4 means there are 4 GPUs
 )
-from sglang.srt.layers.activation import SiluAndMul
+from sglang.srt.layers.activation import SiluAndMul # SiluAndMul = SwiGLU activation in Cohere
+
 from sglang.srt.layers.linear import (
-    MergedColumnParallelLinear,
-    QKVParallelLinear,
-    RowParallelLinear,
+    MergedColumnParallelLinear, # ColumnParallelLinear but they use the same input X, but several different weights, A, B, C
+                                # previously, compute X @ A, X @ B, X @ C, 3x different kernel launches
+                                # merge A, B, C together into ABC
+                                # then only do one matmul y = X @ ABC
+                                # and then y[0:aaa] = X @ A
+                                # and then y[aaa:bbb] = X @ B
+                                # do everything in one matmul
+    QKVParallelLinear, # this is mostly used for GroupedQueryAttention / MultiQueryAttention where you have fewer KV heads than Qs
+    RowParallelLinear, # splits weights by row. used right after ColumnParallelLinear to save on communication
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -80,12 +88,14 @@ def layer_norm_func(hidden_states, weight, variance_epsilon):
 
 
 class LayerNorm(nn.Module):
-    def __init__(self, param_shape=None, eps=1e-5):
+    def __init__(self, param_shape: Tuple | int, eps=1e-5):
         super().__init__()
-        self.weight = nn.Parameter(torch.ones(param_shape))
+        self.weight = nn.Parameter(torch.ones(param_shape)) # turns out the CohereModel actually does have a weight parameter
         self.variance_epsilon = eps
         set_weight_attrs(self.weight, {"weight_loader": self.weight_loader})
 
+    # TODO: Does the forward signature need a residuals? It is not in the CohereLayerNorm impl on HF.
+    # It seems like residuals is passed in and passed out without being used and is also not in CohereLayerNorm
     def forward(self, hidden_states, residuals=None):
         hidden_states = layer_norm_func(
             hidden_states, self.weight, self.variance_epsilon
@@ -138,7 +148,14 @@ class CohereMLP(nn.Module):
         x, _ = self.down_proj(x)
         return x
 
-
+# TODO: need to support sliding window attention here.
+# TODO: seems like Cohere2Attention does not have QK normalization
+#       whereas CohereAttention has self.use_qk_norm = config.use_qk_norm and conditionally
+#       and conditionally creates self.q_norm, self.k_norm
+# TODO: Cohere2Attention applies RoPE only when there is sliding windows
+#       CohereAttention uses RoPE after QK norm if used.
+#       Cohere2Attention does .view(hidden_shape).transpose(1, 2) immediate after projection
+#       CohereAttention does .view first, then QK norm, then transpose
 class CohereAttention(nn.Module):
     def __init__(
         self,
@@ -150,7 +167,7 @@ class CohereAttention(nn.Module):
         super().__init__()
         tp_size = get_tensor_model_parallel_world_size()
         self.config = config
-        self.attention_dropout = config.attention_dropout
+        self.attention_dropout = config.attention_dropout # does this get used?
         self.hidden_size = config.hidden_size
         self.total_num_heads = config.num_attention_heads
         self.num_heads = self.total_num_heads // tp_size
@@ -252,19 +269,19 @@ class CohereDecoderLayer(nn.Module):
         super().__init__()
         self.hidden_size = config.hidden_size
 
-        self.self_attn = CohereAttention(
+        self.self_attn = CohereAttention( # cohere attention
             config,
             layer_id=layer_id,
             quant_config=quant_config,
             prefix=add_prefix("self_attn", prefix),
         )
 
-        self.mlp = CohereMLP(
+        self.mlp = CohereMLP( # a cohere linear layer blocks
             config,
             quant_config=quant_config,
             prefix=add_prefix("mlp", prefix),
         )
-        self.input_layernorm = LayerNorm(
+        self.input_layernorm = LayerNorm( # cohere layernorm blocks
             param_shape=(config.hidden_size), eps=config.layer_norm_eps
         )
 
@@ -277,15 +294,15 @@ class CohereDecoderLayer(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # Self Attention
         residual = hidden_states
-        hidden_states, residual = self.input_layernorm(hidden_states, residual)
-        hidden_states_attention = self.self_attn(
+        hidden_states, residual = self.input_layernorm(hidden_states, residual) # pre-attn layernorm (I see)
+        hidden_states_attention = self.self_attn( # and then self attention
             positions=positions,
             hidden_states=hidden_states,
             forward_batch=forward_batch,
         )
-        hidden_states_mlp = self.mlp(hidden_states)
+        hidden_states_mlp = self.mlp(hidden_states) # mlp
         # Add everything together
-        hidden_states = residual + hidden_states_attention + hidden_states_mlp
+        hidden_states = residual + hidden_states_attention + hidden_states_mlp # residuals
 
         return hidden_states, residual
 
@@ -299,21 +316,23 @@ class CohereModel(nn.Module):
     ):
         super().__init__()
         self.config = config
-        self.vocab_size = config.vocab_size
+        self.vocab_size = config.vocab_size # does self.vocab_size ever get used?
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size, config.hidden_size
         )
+        # instantiates like `config.num_hidden_layers` many Cohere decoder blocks
         self.layers = nn.ModuleList(
             [
                 CohereDecoderLayer(
                     config,
-                    i,
+                    i, # layer id
                     quant_config=quant_config,
                     prefix=add_prefix(f"layers.{i}", prefix),
                 )
                 for i in range(config.num_hidden_layers)
             ]
         )
+        # they have a layernorm layer
         self.norm = LayerNorm(
             param_shape=(config.hidden_size), eps=config.layer_norm_eps
         )
@@ -324,34 +343,34 @@ class CohereModel(nn.Module):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        hidden_states = self.embed_tokens(input_ids)
-        residual = None
-        for i in range(len(self.layers)):
-            layer = self.layers[i]
-            hidden_states, residual = layer(
-                positions,
-                hidden_states,
-                forward_batch,
+        hidden_states = self.embed_tokens(input_ids) # convert the token IDs to actual embeddings
+        residual = None # no residuals
+        for i in range(len(self.layers)): # for each decoder block, 
+            layer = self.layers[i] # grab layer
+            hidden_states, residual = layer( # pass variable through layer
+                positions, # positions
+                hidden_states, # hidden states after passing through i-1 decoder blocks
+                forward_batch, # whatever this is
                 residual,
             )
-        hidden_states, _ = self.norm(hidden_states, residual)
-        return hidden_states
+        hidden_states, _ = self.norm(hidden_states, residual) # normalizes at the end
+        return hidden_states # return final hidden states, to be passed onto the logits processor
 
 
 class CohereForCausalLM(nn.Module):
     def __init__(
         self,
-        config: PretrainedConfig,
-        quant_config: Optional[QuantizationConfig] = None,
+        config: PretrainedConfig, # from HF transformers
+        quant_config: Optional[QuantizationConfig] = None, # you can choose your quantization methods
         prefix: str = "",
     ) -> None:
         super().__init__()
-        self.config = config
-        self.quant_config = quant_config
-        self.logits_processor = LogitsProcessor(config)
+        self.config = config # set the model's config from HF
+        self.quant_config = quant_config # we have the quantization configs
+        self.logits_processor = LogitsProcessor(config) # we also have a logits processor from the HF config
         self.model = CohereModel(
             config, quant_config, prefix=add_prefix("model", prefix)
-        )
+        ) # instantiate the model
 
     @torch.no_grad()
     def forward(
@@ -368,7 +387,7 @@ class CohereForCausalLM(nn.Module):
         return self.logits_processor(
             input_ids, hidden_states, self.model.embed_tokens, forward_batch
         )
-
+    # TODO figure out what this does later
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
@@ -412,7 +431,14 @@ class CohereForCausalLM(nn.Module):
 
 
 class Cohere2ForCausalLM(CohereForCausalLM):
+    # we need to instantiate CohereModel
+    # in the CohereModel, we might need to have it where we might need to add in sliding windows parameters from HF config
+    # this will let us instantiate RadixAttention differently depending on which layer we are at.
+    # the question is how similar is the CohereModel for Cohere2 vs Cohere1 and whether we need an entirely new class for Cohere2 
+    # probably will take 2.5 weeks to finish
     pass
+        
+        
 
 
 EntryClass = [CohereForCausalLM, Cohere2ForCausalLM]
